@@ -70,6 +70,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from harness.middleware import Middleware
 
 
@@ -79,16 +81,86 @@ class Critic(Middleware):
     name = "critic"
 
     def after_agent(self, ctx, report):
-        # TODO (§2): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; nếu rỗng hoặc không phải list thì thôi.
-        #  2. Với mỗi claim: nếu claim["text"] có trong ctx.observed_text
-        #     -> giữ nguyên (KHÔNG sửa chữ).
-        #  3. Nếu không: thử tách câu ghép (trường hợp (c) ở docstring).
-        #     Tách được -> giữ cả hai nửa, mỗi nửa gắn doc_id của tài liệu
-        #     thật sự chứa nó, và đặt report["abstain"] = True.
-        #  4. Không tách được -> đây là bịa: bỏ claim đi.
-        #  5. Nếu không còn claim nào: report["abstain"] = True,
-        #     claims = [], citations = [], và viết lại "answer" nói rõ là
-        #     không đủ căn cứ.
-        #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để kết luận dựa trên các tài liệu hiện có."
+            return report
+
+        observed = getattr(ctx, "observed_text", "")
+        seen_ids = set(
+            re.findall(
+                r"doc-\d{4}",
+                "\n".join(
+                    m.get("content", "")
+                    for m in getattr(ctx, "messages", [])
+                    if isinstance(m, dict)
+                ),
+            )
+        )
+
+        def _is_doc_seen(doc) -> bool:
+            if not doc:
+                return False
+            if doc.body and doc.body in observed:
+                return True
+            return doc.doc_id in seen_ids
+
+        def _find_doc(part: str):
+            if not part or part not in observed:
+                return None
+            if getattr(ctx, "corpus", None) is not None:
+                for doc in ctx.corpus.docs:
+                    if doc.body and doc.body in observed and any(part in line for line in doc.body.splitlines()):
+                        return doc.doc_id
+                for doc in ctx.corpus.docs:
+                    if _is_doc_seen(doc) and any(part in line for line in doc.body.splitlines()):
+                        return doc.doc_id
+            return None
+
+        def _try_split_conjunction(text: str):
+            idx = 0
+            while True:
+                pos = text.find(" và ", idx)
+                if pos == -1:
+                    break
+                head = text[:pos]
+                tail = text[pos + 4:]
+                doc_head = _find_doc(head)
+                doc_tail = _find_doc(tail)
+                if doc_head and doc_tail and doc_head != doc_tail:
+                    return head, doc_head, tail, doc_tail
+                idx = pos + 4
+            return None
+
+        new_claims = []
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            if text and text in observed:
+                new_claims.append(claim)
+            else:
+                split_res = _try_split_conjunction(text)
+                if split_res:
+                    head, doc_head, tail, doc_tail = split_res
+                    new_claims.append({"text": head, "doc_id": doc_head})
+                    new_claims.append({"text": tail, "doc_id": doc_tail})
+                    report["abstain"] = True
+                else:
+                    pass
+
+        if not new_claims:
+            report["abstain"] = True
+            report["claims"] = []
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để kết luận dựa trên các tài liệu hiện có."
+        else:
+            report["claims"] = new_claims
+            report["citations"] = sorted({c["doc_id"] for c in new_claims if c.get("doc_id")})
+
+        return report

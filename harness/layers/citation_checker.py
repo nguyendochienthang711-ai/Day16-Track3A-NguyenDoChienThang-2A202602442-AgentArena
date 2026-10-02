@@ -59,6 +59,8 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
+import re
+
 from harness.middleware import Middleware
 
 
@@ -68,16 +70,58 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not isinstance(report, dict):
+            return report
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or getattr(ctx, "corpus", None) is None:
+            return report
+
+        observed = getattr(ctx, "observed_text", "")
+        seen_ids = set(
+            re.findall(
+                r"doc-\d{4}",
+                "\n".join(
+                    m.get("content", "")
+                    for m in getattr(ctx, "messages", [])
+                    if isinstance(m, dict)
+                ),
+            )
+        )
+
+        def _is_doc_seen(doc) -> bool:
+            if not doc:
+                return False
+            if doc.body and doc.body in observed:
+                return True
+            return doc.doc_id in seen_ids
+
+        def _in_line(text: str, doc) -> bool:
+            if not doc or not doc.body or not text:
+                return False
+            return any(text in line for line in doc.body.splitlines())
+
+        for claim in claims:
+            if not isinstance(claim, dict):
+                continue
+            text = claim.get("text", "")
+            current_id = claim.get("doc_id", "")
+            current_doc = ctx.corpus.get(current_id)
+
+            if current_doc and _in_line(text, current_doc) and _is_doc_seen(current_doc):
+                continue
+
+            found = False
+            for doc in ctx.corpus.docs:
+                if doc.body and doc.body in observed and _in_line(text, doc):
+                    claim["doc_id"] = doc.doc_id
+                    found = True
+                    break
+
+            if not found:
+                for doc in ctx.corpus.docs:
+                    if _is_doc_seen(doc) and _in_line(text, doc):
+                        claim["doc_id"] = doc.doc_id
+                        break
+
+        report["citations"] = sorted({c["doc_id"] for c in claims if isinstance(c, dict) and c.get("doc_id")})
+        return report
