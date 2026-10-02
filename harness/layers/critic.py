@@ -86,7 +86,10 @@ from __future__ import annotations
 
 import re
 
-from harness.evidence import Evidence
+try:
+    from harness.layers.evidence import Evidence
+except Exception:
+    from harness.evidence import Evidence
 from harness.middleware import Middleware
 
 FLOOR_ANSWER = "Không đủ căn cứ để kết luận dựa trên các tài liệu hiện có."
@@ -112,10 +115,18 @@ class Critic(Middleware):
     @staticmethod
     def _cuts(text: str):
         """Mọi cách chia `text` thành (đầu, đuôi) tại một chỗ dán."""
-        for m in _SEP_RE.finditer(text):
-            if m.group(0) == ". ":  # ưu tiên giữ dấu chấm cho nửa đầu
-                yield text[: m.start() + 1], text[m.end():]
-            yield text[: m.start()], text[m.end():]
+        for sep in _SEPARATORS:
+            pos = 0
+            while True:
+                pos = text.find(sep, pos)
+                if pos == -1:
+                    break
+                if sep == ". ":
+                    yield text[: pos + 1], text[pos + len(sep) :]
+                yield text[:pos], text[pos + len(sep) :]
+                pos += 1
+        for m in re.finditer(r"\n", text):
+            yield text[: m.start()], text[m.end() :]
 
     def _decompose(self, ev, text: str, prefer: str, depth: int):
         piece = text.strip()

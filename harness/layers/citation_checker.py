@@ -69,7 +69,10 @@ GHI CHÚ CÀI ĐẶT (bản tối ưu):
 
 from __future__ import annotations
 
-from harness.evidence import Evidence
+try:
+    from harness.layers.evidence import Evidence
+except Exception:
+    from harness.evidence import Evidence
 from harness.middleware import Middleware
 
 

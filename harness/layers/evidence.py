@@ -24,10 +24,13 @@ import re
 _DOC_ID_RE = re.compile(r"doc-\d{4}")
 
 try:  # cùng một hàm làm sạch với injection_guard
-    from harness.injection_guard import sanitize_untrusted as _sanitize
-except Exception:  # pragma: no cover - chỉ để module độc lập khi test
-    def _sanitize(text: str) -> str:
-        return text
+    from harness.layers.injection_guard import sanitize_untrusted as _sanitize
+except Exception:
+    try:
+        from harness.injection_guard import sanitize_untrusted as _sanitize
+    except Exception:  # pragma: no cover - chỉ để module độc lập khi test
+        def _sanitize(text: str) -> str:
+            return text
 
 
 class Evidence:

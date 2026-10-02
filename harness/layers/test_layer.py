@@ -1,15 +1,17 @@
 """Kiểm thử logic các layer bằng stub `arena` (KHÔNG thay cho scripts/run_practice.py)."""
 import json, sys, os
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 from dataclasses import dataclass, field
 from arena.corpus import INJECTION_CANARY
 from arena.tools import ToolResult
 from arena.model import FINALIZE_SENTINEL
-from harness.critic import Critic, FLOOR_ANSWER
-from harness.citation_checker import CitationChecker
-from harness.injection_guard import InjectionGuard, BLOCK_START, BLOCK_END, PLACEHOLDER
-from harness.retry import Retry
-from harness.budget_policy import BudgetPolicy
+from harness.layers.critic import Critic, FLOOR_ANSWER
+from harness.layers.citation_checker import CitationChecker
+from harness.layers.injection_guard import InjectionGuard, BLOCK_START, BLOCK_END, PLACEHOLDER
+from harness.layers.retry import Retry
+from harness.layers.budget_policy import BudgetPolicy
 from harness.agent import ReActAgent, AgentContext
 
 
@@ -160,7 +162,7 @@ class Seq:
 
 def test_retry_recovers_from_noise():
     ctx = mkctx([], budget=8)
-    seq = Seq([ToolResult(True, "[NOISE] ..."), ToolResult(True, "sạch")], ctx.tools)
+    seq = Seq([ToolResult(True, "[NOISE: corrupt] ..."), ToolResult(True, "sạch")], ctx.tools)
     r = Retry().wrap_tool_call(ctx, seq, "search", {"query": "x"})
     assert r.content == "sạch" and seq.i == 2
 
