@@ -47,6 +47,8 @@ nên lớp cần "chốt hạ" cuối cùng phải đứng đầu tiên.
 
 from __future__ import annotations
 
+import re
+
 from arena.corpus import INJECTION_CANARY
 from arena.tools import ToolResult
 from harness.middleware import Middleware
@@ -57,6 +59,45 @@ BLOCK_END = "--- HẾT LƯU Ý HỆ THỐNG ---"
 PLACEHOLDER = "[nội dung không đáng tin cậy đã bị loại bỏ]"
 
 
+#: Phần đuôi `[TRUNCATED: ...]` mà tầng công cụ gắn vào một lần fetch bị cắt.
+_TRUNC_TAIL_RE = re.compile(r"\[TRUNCATED[^\]]*\]\s*\Z")
+_CANARY_RE = re.compile(re.escape(INJECTION_CANARY), re.IGNORECASE)
+
+
+def sanitize_untrusted(text: str) -> str:
+    """Cắt mọi đoạn LƯU Ý HỆ THỐNG và mọi con canary khỏi `text`.
+
+    Hàm thuần, dùng chung với `harness/evidence.py` để kiểm tra "toàn văn tài
+    liệu có nằm trong quan sát không" sau khi quan sát đã bị làm sạch.
+
+    Hai điểm khác bản đầu:
+      * Đoạn độc bị cắt đứt giữa chừng (có mốc MỞ, không có mốc ĐÓNG) thì đuôi
+        `[TRUNCATED: ...]` vẫn được GIỮ LẠI. Trước đây nó bị xoá cùng đoạn độc,
+        nên mô hình không còn thấy bất cứ dấu hiệu nào rằng bản fetch bị cắt.
+      * Canary bị xoá thẳng chuỗi, không phụ thuộc vào dấu mốc. Mô hình khoá
+        theo SỰ CÓ MẶT của canary trong message, nên đây là chốt chặn cuối của
+        biên: dù dấu mốc bị hỏng, bị cắt hay bị đổi dạng, canary vẫn không lọt.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    content = text
+    while BLOCK_START in content:
+        start_idx = content.find(BLOCK_START)
+        end_idx = content.find(BLOCK_END, start_idx)
+        if end_idx != -1:
+            content = content[:start_idx] + PLACEHOLDER + content[end_idx + len(BLOCK_END):]
+        else:
+            tail = _TRUNC_TAIL_RE.search(content, start_idx)
+            content = content[:start_idx] + PLACEHOLDER + (("\n" + tail.group(0).strip()) if tail else "")
+            break
+    content = content.replace(BLOCK_END, "")  # mốc ĐÓNG mồ côi
+    return _CANARY_RE.sub("", content)
+
+
+def _scrub(text):
+    return _CANARY_RE.sub("", text) if isinstance(text, str) else text
+
+
 class InjectionGuard(Middleware):
     """Coi nội dung tài liệu là dữ liệu: cách ly nó, rồi soát lại câu trả lời."""
 
@@ -64,21 +105,45 @@ class InjectionGuard(Middleware):
 
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
-        if not result.content or BLOCK_START not in result.content:
+        if result is None or not hasattr(result, "content"):
             return result
-        content = result.content
-        while BLOCK_START in content:
-            start_idx = content.find(BLOCK_START)
-            end_idx = content.find(BLOCK_END, start_idx)
-            if end_idx != -1:
-                content = content[:start_idx] + PLACEHOLDER + content[end_idx + len(BLOCK_END):]
-            else:
-                content = content[:start_idx] + PLACEHOLDER
-                break
-        return ToolResult(ok=result.ok, content=content, error=result.error)
+        content = result.content if isinstance(result.content, str) else ""
+        error = result.error if isinstance(getattr(result, "error", None), str) else getattr(result, "error", None)
+        clean_content = sanitize_untrusted(content)
+        clean_error = sanitize_untrusted(error) if isinstance(error, str) else error
+        if clean_content == content and clean_error == error:
+            return result
+        if hasattr(ctx, "state") and isinstance(ctx.state, dict):
+            ctx.state["injection_blocks_removed"] = ctx.state.get("injection_blocks_removed", 0) + 1
+        return ToolResult(ok=result.ok, content=clean_content, error=clean_error)
+
+    def before_model(self, ctx, messages):
+        """Lưới thứ hai: không để canary nằm trong bất kỳ message nào gửi đi.
+
+        Trả về BẢN SAO chỉ khi thật sự có gì để xoá; lịch sử chuẩn của agent
+        không bị đụng tới (xem `agent.run`: `before_model` nhận một bản sao)."""
+        if not any(isinstance(m, dict) and INJECTION_CANARY.lower() in str(m.get("content", "")).lower() for m in messages):
+            return messages
+        out = []
+        for m in messages:
+            if isinstance(m, dict) and isinstance(m.get("content"), str):
+                m = {**m, "content": _scrub(m["content"])}
+            out.append(m)
+        return out
 
     def after_agent(self, ctx, report):
-        if isinstance(report, dict) and "answer" in report and isinstance(report["answer"], str):
-            if INJECTION_CANARY in report["answer"]:
-                report["answer"] = report["answer"].replace(INJECTION_CANARY, "").strip()
+        """Quét lần cuối. `answer` (và các trường chuỗi cấp cao nhất như
+        `verdict`) được làm sạch; `claims[*].text` TUYỆT ĐỐI không đụng tới."""
+        if not isinstance(report, dict):
+            return report
+        for key, value in list(report.items()):
+            if key in ("claims", "citations") or not isinstance(value, str):
+                continue
+            scrubbed = _scrub(value)
+            if scrubbed == value:  # không có canary: giữ nguyên từng ký tự
+                continue
+            cleaned = scrubbed.strip()
+            if key == "answer" and not cleaned:
+                cleaned = "Không có thông tin đáng tin cậy để trả lời."
+            report[key] = cleaned
         return report

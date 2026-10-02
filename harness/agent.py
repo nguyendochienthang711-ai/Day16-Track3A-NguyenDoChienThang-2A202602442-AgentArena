@@ -110,6 +110,7 @@ from dataclasses import dataclass, field
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
     TOOL_ERROR_PREFIX,
+    is_degraded,
     parse_output,
 )
 from arena.tools import ToolResult
@@ -418,6 +419,14 @@ class AgentContext:
     state: dict = field(default_factory=dict)
     step: int = 0
     stop_reason: str = ""
+    #: SỔ ĐỌC TÀI LIỆU, do `ReActAgent._observe` ghi. `fetched` là các lần
+    #: `fetch_doc` thành công và SẠCH (doc_id -> nội dung mô hình đã thấy);
+    #: `fetched_partial` là các lần ok=True nhưng bị cắt/nhiễu. Đây là nguồn
+    #: đáng tin duy nhất cho câu hỏi "tài liệu này đã được đọc chưa" —
+    #: `harness/evidence.py` dựa vào nó thay vì quét regex mã tài liệu trên
+    #: toàn bộ `messages` (vốn tính cả system prompt và ACTION hỏng).
+    fetched: dict = field(default_factory=dict)
+    fetched_partial: dict = field(default_factory=dict)
 
     @property
     def question(self) -> str:
@@ -656,10 +665,29 @@ class ReActAgent:
             )
 
         call = self.middleware.wrap_tool_call(ctx, self._dispatch)
-        result = call(parsed.tool, dict(parsed.args))
+        args = dict(parsed.args) if isinstance(parsed.args, dict) else {}
+        result = call(parsed.tool, args)
         if result is None or not hasattr(result, "ok"):
             return f"{TOOL_ERROR_PREFIX} layer trả về kết quả không hợp lệ cho {parsed.tool}"
-        return result.content if result.ok else f"{TOOL_ERROR_PREFIX} {result.error}"
+        if not result.ok:
+            return f"{TOOL_ERROR_PREFIX} {_as_text(result.error)}"
+        content = _as_text(result.content)
+        if parsed.tool == "fetch_doc":
+            self._record_fetch(ctx, args, content)
+        return content
+
+    @staticmethod
+    def _record_fetch(ctx: AgentContext, args: dict, content: str) -> None:
+        """Ghi vào sổ đọc những gì mô hình THỰC SỰ được thấy sau cả chuỗi layer."""
+        doc_id = _as_text(args.get("doc_id")).strip()
+        if not doc_id or not content:
+            return
+        if is_degraded(content):
+            if doc_id not in ctx.fetched:  # bản sạch đã có thì không hạ cấp
+                ctx.fetched_partial[doc_id] = content
+        else:
+            ctx.fetched[doc_id] = content
+            ctx.fetched_partial.pop(doc_id, None)
 
     def _dispatch(self, name: str, args: dict) -> ToolResult:
         """The innermost tool call — what `wrap_tool_call` wraps."""

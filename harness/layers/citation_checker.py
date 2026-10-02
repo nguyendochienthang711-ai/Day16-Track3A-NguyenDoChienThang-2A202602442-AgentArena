@@ -55,12 +55,21 @@ CÔNG CỤ CÓ SẴN:
 
 Cài đặt:  ReActAgent(..., middleware=[..., CitationChecker(), ...])
 Xem `harness/middleware.py` để biết thứ tự các hook.
+
+GHI CHÚ CÀI ĐẶT (bản tối ưu):
+  * Bằng chứng lấy từ `harness/evidence.py`: chỉ tài liệu agent THỰC SỰ thấy
+    (sổ `ctx.fetched` do agent ghi + quan sát), không còn quét `ctx.messages`
+    nên system prompt hay ACTION hỏng của chính mô hình không còn làm một tài
+    liệu "đã đọc".
+  * Khi NHIỀU tài liệu cùng chứa dòng đó (tài liệu lookalike/outdated hay chép
+    nguyên câu của bản gốc), chọn tài liệu chứa được NHIỀU claim nhất của báo
+    cáo — bản gốc thường đỡ cả mấy claim, bản nhái thì không — rồi mới đến thứ
+    tự trong corpus. Trước đây luôn lấy tài liệu đứng đầu corpus.
 """
 
 from __future__ import annotations
 
-import re
-
+from harness.evidence import Evidence
 from harness.middleware import Middleware
 
 
@@ -76,52 +85,42 @@ class CitationChecker(Middleware):
         if not isinstance(claims, list) or not claims or getattr(ctx, "corpus", None) is None:
             return report
 
-        observed = getattr(ctx, "observed_text", "")
-        seen_ids = set(
-            re.findall(
-                r"doc-\d{4}",
-                "\n".join(
-                    m.get("content", "")
-                    for m in getattr(ctx, "messages", [])
-                    if isinstance(m, dict)
-                ),
-            )
-        )
+        ev = Evidence(ctx)
+        texts = [c.get("text") for c in claims if isinstance(c, dict) and isinstance(c.get("text"), str)]
 
-        def _is_doc_seen(doc) -> bool:
-            if not doc:
-                return False
-            if doc.body and doc.body in observed:
-                return True
-            return doc.doc_id in seen_ids
+        # Số claim của báo cáo mà mỗi tài liệu đỡ được (theo từng DÒNG).
+        support: dict = {}
 
-        def _in_line(text: str, doc) -> bool:
-            if not doc or not doc.body or not text:
-                return False
-            return any(text in line for line in doc.body.splitlines())
+        def _support(doc) -> int:
+            if doc.doc_id not in support:
+                support[doc.doc_id] = sum(1 for t in texts if ev.in_line(t, doc))
+            return support[doc.doc_id]
 
+        moved = 0
         for claim in claims:
             if not isinstance(claim, dict):
                 continue
             text = claim.get("text", "")
-            current_id = claim.get("doc_id", "")
-            current_doc = ctx.corpus.get(current_id)
-
-            if current_doc and _in_line(text, current_doc) and _is_doc_seen(current_doc):
+            if not isinstance(text, str) or not text:
+                continue
+            current = ev.get(claim.get("doc_id", ""))
+            if current and ev.in_line(text, current) and ev.is_seen(current):
                 continue
 
-            found = False
-            for doc in ctx.corpus.docs:
-                if doc.body and doc.body in observed and _in_line(text, doc):
-                    claim["doc_id"] = doc.doc_id
-                    found = True
-                    break
+            cands = ev.candidates(text)  # đã xếp: sạch trước, rồi thứ tự corpus
+            if not cands:
+                continue  # không có nguồn nào: để `critic` quyết định xoá
+            best = min(
+                cands,
+                key=lambda d: (not ev.is_clean(d), -_support(d), ev.order.get(d.doc_id, 0)),
+            )
+            if claim.get("doc_id") != best.doc_id:
+                claim["doc_id"] = best.doc_id
+                moved += 1
 
-            if not found:
-                for doc in ctx.corpus.docs:
-                    if _is_doc_seen(doc) and _in_line(text, doc):
-                        claim["doc_id"] = doc.doc_id
-                        break
-
-        report["citations"] = sorted({c["doc_id"] for c in claims if isinstance(c, dict) and c.get("doc_id")})
+        if isinstance(getattr(ctx, "state", None), dict):
+            ctx.state["citations_reattributed"] = moved
+        report["citations"] = sorted(
+            {c["doc_id"] for c in claims if isinstance(c, dict) and c.get("doc_id")}
+        )
         return report

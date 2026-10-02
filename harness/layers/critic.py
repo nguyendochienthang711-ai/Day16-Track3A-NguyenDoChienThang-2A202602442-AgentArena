@@ -66,13 +66,40 @@ CÔNG CỤ CÓ SẴN:
 
 Cài đặt:  ReActAgent(..., middleware=[InjectionGuard(), Critic(), ...])
 Xem `harness/middleware.py` để biết thứ tự các hook.
+
+GHI CHÚ CÀI ĐẶT (bản tối ưu):
+  * Tín hiệu mạnh hơn `text in observed`: câu phải nằm trong quan sát VÀ nằm
+    gọn trong MỘT DÒNG của một tài liệu đã thấy (`Evidence.grounded`). Một
+    claim ghép hai dòng của cùng một tài liệu từng lọt qua tín hiệu cũ vì
+    quan sát nối các dòng lại, nhưng scorer chấm nó `HALLUCINATED` — mất cả 15
+    điểm honesty. Giờ nó bị bắt.
+  * Thay vì xoá thẳng, thử CỨU claim bằng phép CẮT (hợp lệ: chỉ cắt, không sửa
+    chữ): (1) tách tại chỗ dán ("và", ";", ", còn", "nhưng", ". "...) thành
+    các mảnh mỗi mảnh nguyên văn một dòng — đệ quy tối đa 3 tầng; nếu các
+    mảnh thuộc >1 tài liệu thì đó là mâu thuẫn -> `abstain: true`; (2) không
+    tách được thì giữ đoạn liền mạch dài nhất còn nguyên văn một dòng.
+  * Không chạm `claim["text"]` của claim đã hợp lệ; mảnh cắt luôn là một
+    substring của chữ mô hình đã viết.
 """
 
 from __future__ import annotations
 
 import re
 
+from harness.evidence import Evidence
 from harness.middleware import Middleware
+
+FLOOR_ANSWER = "Không đủ căn cứ để kết luận dựa trên các tài liệu hiện có."
+
+#: Chỗ mô hình thường dán hai nửa câu. Thứ tự không quan trọng; mọi vị trí
+#: xuất hiện đều được thử.
+_SEPARATORS = (" và ", "; ", ", còn ", " còn ", " trong khi ", " nhưng ", " tuy nhiên ", " | ", ". ")
+_SEP_RE = re.compile("|".join(re.escape(s) for s in _SEPARATORS) + r"|\n")
+
+#: Mảnh ngắn hơn mức này coi như vụn: dễ trùng ngẫu nhiên, không đáng giữ.
+MIN_PIECE = 12
+MIN_SALVAGE = 20
+MAX_DEPTH = 3
 
 
 class Critic(Middleware):
@@ -80,87 +107,129 @@ class Critic(Middleware):
 
     name = "critic"
 
+    # -- phân rã --------------------------------------------------------
+
+    @staticmethod
+    def _cuts(text: str):
+        """Mọi cách chia `text` thành (đầu, đuôi) tại một chỗ dán."""
+        for m in _SEP_RE.finditer(text):
+            if m.group(0) == ". ":  # ưu tiên giữ dấu chấm cho nửa đầu
+                yield text[: m.start() + 1], text[m.end():]
+            yield text[: m.start()], text[m.end():]
+
+    def _decompose(self, ev, text: str, prefer: str, depth: int):
+        piece = text.strip()
+        if len(piece) >= MIN_PIECE and ev.grounded(piece):
+            return [(piece, self._pick_doc(ev, piece, prefer))]
+        if depth <= 0:
+            return None
+        for head, tail in self._cuts(piece):
+            if len(head.strip()) < MIN_PIECE or len(tail.strip()) < MIN_PIECE:
+                continue
+            left = self._decompose(ev, head, prefer, depth - 1)
+            if left is None:
+                continue
+            right = self._decompose(ev, tail, prefer, depth - 1)
+            if right is None:
+                continue
+            return left + right
+        return None
+
+    @staticmethod
+    def _pick_doc(ev, piece: str, prefer: str):
+        cands = ev.candidates(piece)
+        if not cands:
+            return prefer or None  # không có corpus: giữ doc_id mô hình đã ghi
+        for doc in cands:
+            if doc.doc_id == prefer:
+                return doc.doc_id
+        return cands[0].doc_id
+
+    def _salvage(self, ev, text: str, prefer: str):
+        """Đoạn liền mạch DÀI NHẤT của `text` (cắt tại chỗ dán) còn nguyên văn một dòng."""
+        bounds = (
+            [(0, 0)]
+            + [(m.start() + (1 if m.group(0) == ". " else 0), m.end()) for m in _SEP_RE.finditer(text)]
+            + [(len(text), len(text))]
+        )
+        segs = [(bounds[i][1], bounds[i + 1][0]) for i in range(len(bounds) - 1)]
+        best = None
+        for i in range(len(segs)):
+            for j in range(i, len(segs)):
+                piece = text[segs[i][0]: segs[j][1]].strip()
+                if len(piece) < MIN_SALVAGE or (best and len(piece) <= len(best)):
+                    continue
+                if ev.grounded(piece):
+                    best = piece
+        return (best, self._pick_doc(ev, best, prefer)) if best else None
+
+    # -- hook -----------------------------------------------------------
+
     def after_agent(self, ctx, report):
         if not isinstance(report, dict):
             return report
         claims = report.get("claims")
         if not isinstance(claims, list) or not claims:
-            report["abstain"] = True
-            report["claims"] = []
-            report["citations"] = []
-            report["answer"] = "Không đủ căn cứ để kết luận dựa trên các tài liệu hiện có."
-            return report
+            return self._floor(report)
 
-        observed = getattr(ctx, "observed_text", "")
-        seen_ids = set(
-            re.findall(
-                r"doc-\d{4}",
-                "\n".join(
-                    m.get("content", "")
-                    for m in getattr(ctx, "messages", [])
-                    if isinstance(m, dict)
-                ),
-            )
-        )
+        ev = Evidence(ctx)
+        kept: list = []
+        keys: set = set()
+        stats = {"dropped": 0, "trimmed": 0, "split": 0}
+        contradiction = False
 
-        def _is_doc_seen(doc) -> bool:
-            if not doc:
-                return False
-            if doc.body and doc.body in observed:
-                return True
-            return doc.doc_id in seen_ids
+        def add(item: dict) -> None:
+            key = (item.get("text"), item.get("doc_id"))
+            if key not in keys:
+                keys.add(key)
+                kept.append(item)
 
-        def _find_doc(part: str):
-            if not part or part not in observed:
-                return None
-            if getattr(ctx, "corpus", None) is not None:
-                for doc in ctx.corpus.docs:
-                    if doc.body and doc.body in observed and any(part in line for line in doc.body.splitlines()):
-                        return doc.doc_id
-                for doc in ctx.corpus.docs:
-                    if _is_doc_seen(doc) and any(part in line for line in doc.body.splitlines()):
-                        return doc.doc_id
-            return None
-
-        def _try_split_conjunction(text: str):
-            idx = 0
-            while True:
-                pos = text.find(" và ", idx)
-                if pos == -1:
-                    break
-                head = text[:pos]
-                tail = text[pos + 4:]
-                doc_head = _find_doc(head)
-                doc_tail = _find_doc(tail)
-                if doc_head and doc_tail and doc_head != doc_tail:
-                    return head, doc_head, tail, doc_tail
-                idx = pos + 4
-            return None
-
-        new_claims = []
         for claim in claims:
             if not isinstance(claim, dict):
                 continue
-            text = claim.get("text", "")
-            if text and text in observed:
-                new_claims.append(claim)
-            else:
-                split_res = _try_split_conjunction(text)
-                if split_res:
-                    head, doc_head, tail, doc_tail = split_res
-                    new_claims.append({"text": head, "doc_id": doc_head})
-                    new_claims.append({"text": tail, "doc_id": doc_tail})
-                    report["abstain"] = True
-                else:
-                    pass
+            text = claim.get("text")
+            if not isinstance(text, str) or not text.strip():
+                stats["dropped"] += 1
+                continue
+            if ev.grounded(text):
+                add(claim)
+                continue
 
-        if not new_claims:
+            prefer = claim.get("doc_id", "") if isinstance(claim.get("doc_id", ""), str) else ""
+            pieces = self._decompose(ev, text, prefer, MAX_DEPTH)
+            if pieces and len(pieces) >= 2:
+                for piece, doc_id in pieces:
+                    add({"text": piece, "doc_id": doc_id})
+                stats["split"] += 1
+                if len({d for _, d in pieces}) > 1:
+                    contradiction = True  # hai nguồn bị ghép: nêu cả hai + abstain
+                continue
+            if pieces:  # chỉ khác ở khoảng trắng đầu/cuối
+                add({"text": pieces[0][0], "doc_id": pieces[0][1]})
+                stats["trimmed"] += 1
+                continue
+            saved = self._salvage(ev, text, prefer)
+            if saved:
+                add({"text": saved[0], "doc_id": saved[1]})
+                stats["trimmed"] += 1
+                continue
+            stats["dropped"] += 1
+
+        if isinstance(getattr(ctx, "state", None), dict):
+            ctx.state["critic"] = stats
+
+        if not kept:
+            return self._floor(report)
+        report["claims"] = kept
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+        if contradiction:
             report["abstain"] = True
-            report["claims"] = []
-            report["citations"] = []
-            report["answer"] = "Không đủ căn cứ để kết luận dựa trên các tài liệu hiện có."
-        else:
-            report["claims"] = new_claims
-            report["citations"] = sorted({c["doc_id"] for c in new_claims if c.get("doc_id")})
+        return report
 
+    @staticmethod
+    def _floor(report: dict) -> dict:
+        report["abstain"] = True
+        report["claims"] = []
+        report["citations"] = []
+        report["answer"] = FLOOR_ANSWER
         return report

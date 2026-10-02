@@ -53,7 +53,7 @@ vừa đọc: -47.16 điểm trên full stack (92.52 -> 45.36), không có một
 thông báo lỗi nào.
 
 CÔNG CỤ CÓ SẴN:
-    from arena.model import FINALIZE_SENTINEL
+    from arena.model import FINALIZE_SENTINEL, is_degraded
     from arena.tools import ToolResult
     ctx.tools.calls      -> số lượt gọi công cụ đã dùng (kể cả submit)
     ctx.max_tool_calls   -> ngân sách của brief, hoặc None nếu brief không đặt
@@ -64,7 +64,7 @@ Xem `harness/middleware.py` để biết thứ tự các hook.
 
 from __future__ import annotations
 
-from arena.model import FINALIZE_SENTINEL
+from arena.model import FINALIZE_SENTINEL, is_degraded
 from arena.tools import ToolResult  # noqa: F401  (dùng trong phần TODO)
 
 from harness.middleware import Middleware
@@ -78,18 +78,44 @@ NUDGE = (
 )
 
 
+def _memo_key(name, args):
+    """Khoá chuẩn hoá cho một lời gọi: bỏ khác biệt hoa/thường và khoảng trắng."""
+    if not isinstance(args, dict):
+        return None
+    norm = {}
+    for key, value in args.items():
+        if isinstance(value, str):
+            value = " ".join(value.split()).lower()
+        norm[str(key)] = value
+    try:
+        return name, tuple(sorted((k, repr(v)) for k, v in norm.items()))
+    except Exception:  # pragma: no cover - args kỳ quặc: không memo
+        return None
+
+
 class BudgetPolicy(Middleware):
-    """Ép mô hình chốt FINAL ngay khi ngân sách công cụ đã tiêu hết."""
+    """Ép mô hình chốt FINAL ngay khi ngân sách công cụ đã tiêu hết.
+
+    Bản tối ưu thêm MỘT thứ: bộ nhớ đệm cho lời gọi lặp. Kế hoạch của mô hình
+    có những lượt "search lặp lại" và "fetch lại tài liệu đã có trong tay";
+    nếu lời gọi y hệt một lời gọi ĐÃ CHO KẾT QUẢ SẠCH thì trả lại kết quả cũ mà
+    không chạm công cụ. `Tools.calls` (và scorer) không đếm lượt nào cả, và vì
+    đệm được kiểm TRƯỚC khi xét ngân sách nên nó vẫn phục vụ khi ngân sách đã
+    cạn. Kết quả hỏng/suy giảm KHÔNG bao giờ được đệm, nên không che mất việc
+    thử lại của `retry`. Tắt bằng `BudgetPolicy(memoize=False)`.
+    """
 
     name = "budget_policy"
 
-    def __init__(self, reserve: int = DEFAULT_RESERVE) -> None:
+    def __init__(self, reserve: int = DEFAULT_RESERVE, memoize: bool = True) -> None:
         self.reserve = max(0, int(reserve))
+        self.memoize = bool(memoize)
 
     def _spent(self, ctx) -> bool:
-        if ctx.max_tool_calls is None:
+        limit = ctx.max_tool_calls
+        if limit is None:
             return False
-        return ctx.tools.calls >= ctx.max_tool_calls - self.reserve
+        return ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
         if not self._spent(ctx):
@@ -97,10 +123,28 @@ class BudgetPolicy(Middleware):
         return messages + [{"role": "user", "content": NUDGE}]
 
     def wrap_tool_call(self, ctx, call, name, args):
+        memo = None
+        key = _memo_key(name, args) if self.memoize else None
+        if key is not None and isinstance(getattr(ctx, "state", None), dict):
+            memo = ctx.state.setdefault("_tool_memo", {})
+            hit = memo.get(key)
+            if hit is not None:
+                ctx.state["memo_hits"] = ctx.state.get("memo_hits", 0) + 1
+                return hit
+
         if self._spent(ctx):
             return ToolResult(
                 ok=False,
                 content="",
                 error="Ngân sách công cụ đã cạn, dành lượt cho submit.",
             )
-        return call(name, args)
+        result = call(name, args)
+        if (
+            memo is not None
+            and result is not None
+            and getattr(result, "ok", False)
+            and isinstance(result.content, str)
+            and not is_degraded(result.content)
+        ):
+            memo[key] = result
+        return result

@@ -72,6 +72,10 @@ DEFAULT_MAX_ATTEMPTS = 3
 DEFAULT_RESERVE = 1
 
 
+#: Công cụ mà agent biết. Tên lạ là lỗi của MÔ HÌNH, gọi lại cũng vô ích.
+_KNOWN_TOOLS = ("search", "fetch_doc", "calc")
+
+
 class Retry(Middleware):
     """Gọi lại một lượt công cụ trả về kết quả hỏng hoặc suy giảm."""
 
@@ -85,12 +89,35 @@ class Retry(Middleware):
         self.max_attempts = max(1, int(max_attempts))
         self.reserve = max(0, int(reserve))
 
+    @staticmethod
+    def _permanent(ctx, name, args) -> bool:
+        """Lỗi do chính lời gọi, không phải do tầng công cụ nhiễu ngẫu nhiên.
+
+        Chỉ những trường hợp CHẮC CHẮN mới được coi là vĩnh viễn: tên công cụ
+        lạ, hoặc fetch_doc một mã không hề có trong corpus. Biểu thức calc sai
+        thì KHÔNG thể phân biệt với lỗi ngẫu nhiên nên vẫn được thử lại."""
+        if name not in _KNOWN_TOOLS:
+            return True
+        corpus = getattr(ctx, "corpus", None)
+        if name == "fetch_doc" and corpus is not None and isinstance(args, dict):
+            doc_id = args.get("doc_id")
+            if isinstance(doc_id, str) and doc_id.strip() and corpus.get(doc_id.strip()) is None:
+                return True
+        return False
+
+    def _out_of_budget(self, ctx) -> bool:
+        limit = ctx.max_tool_calls
+        return limit is not None and ctx.tools.calls >= limit - self.reserve
+
     def wrap_tool_call(self, ctx, call, name, args):
         result = call(name, args)
         attempts = 1
-        while attempts < self.max_attempts and ((not result.ok) or is_degraded(result.content)):
-            if ctx.max_tool_calls is not None and ctx.tools.calls >= ctx.max_tool_calls - self.reserve:
-                break
+        while (
+            attempts < self.max_attempts
+            and ((not result.ok) or is_degraded(result.content))
+            and not self._permanent(ctx, name, args)
+            and not self._out_of_budget(ctx)
+        ):
             result = call(name, args)
             attempts += 1
         if hasattr(ctx, "state") and isinstance(ctx.state, dict):

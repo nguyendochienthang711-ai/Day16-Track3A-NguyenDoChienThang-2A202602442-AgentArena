@@ -297,11 +297,22 @@ class MiddlewareStack:
     def before_model(self, ctx, messages: list[dict]) -> list[dict]:
         for layer in self.middleware:
             messages = layer.before_model(ctx, messages)
+            # Lỗi này im lặng rất khó dò (mô hình nhận None hoặc một chuỗi);
+            # nêu đích danh layer gây ra nó, cùng triết lý "fail loudly".
+            if not isinstance(messages, list):
+                raise TypeError(
+                    f"{layer.label}.before_model must return a list of messages, "
+                    f"got {type(messages).__name__}"
+                )
         return messages
 
     def after_model(self, ctx, response):
         for layer in reversed(self.middleware):
             response = layer.after_model(ctx, response)
+            if response is None:
+                raise TypeError(
+                    f"{layer.label}.after_model must return the ModelResponse, got None"
+                )
         return response
 
     def after_agent(self, ctx, report: dict) -> dict:
